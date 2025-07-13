@@ -1,0 +1,9 @@
+{
+  "pivot_window": 15,
+  "min_distance_pct": 0.005,
+  "entry_confidence_thresh": 0.7,
+  "rsi_period": 14,
+  "rsi_threshold": 50,
+  "risk_per_trade": 0.01,
+  "max_workers": 4
+}

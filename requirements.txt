@@ -1,0 +1,18 @@
+# Add your project's dependencies here.
+# For example:
+# pandas
+# numpy
+# scikit-learn
+# lightgbm
+# tensorflow
+# python-binance
+# python-telegram-bot
+# pyarrow
+# mlflow
+# great-expectations
+# feast
+# redis
+# prometheus-client
+# grafana-client
+# shap
+pyyaml

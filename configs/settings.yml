@@ -1,0 +1,7 @@
+env: prod            # dev / staging / prod
+mode: live           # train / backtest / signal / live
+data_path: ./data
+models_path: ./models
+reports_path: ./reports
+symbols_file: ./symbols.csv
+cycle_break_s: 10
