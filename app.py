@@ -52,7 +52,7 @@ def load_hyperparams(hyperparams_path):
 def load_symbols(symbols_file):
     """Loads symbols from a CSV file."""
     with open(symbols_file, 'r') as file:
-        return [line.strip() for line in file.readlines()]
+        return [line.strip() for line in file.readlines() if line.strip()]
 
 # --- 2. Configuration & Secrets ---
 # Import keys directly
@@ -65,14 +65,25 @@ class DataHandler:
         self.data_path = settings['data_path']
         self.binance_client = BinanceClient(keys.api_testnet, keys.secret_testnet, tld='com', testnet=True)
 
-    def fetch_bars(self, symbol, tf='15m'):
+    def fetch_bars(self, symbol, interval='15m'):
         """
         Fetches bars for a symbol from Binance, caches to Parquet,
         and runs data quality checks.
         """
-        logging.info(f"Fetching {tf} bars for {symbol}...")
+        def is_cache_fresh(path, max_age_hours=12):
+            if not os.path.exists(path):
+                return False
+            age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(path))
+            return age.total_seconds() < max_age_hours * 3600
+
+        cache_path = os.path.join(self.data_path, f"{symbol}_{interval}.parquet")
+
+        if is_cache_fresh(cache_path):
+            logging.info(f"Loading fresh cached {interval} data for {symbol}...")
+            return pd.read_parquet(cache_path)
+
+        logging.info(f"Fetching {interval} bars for {symbol}...")
         try:
-            interval = getattr(BinanceClient, f"KLINE_INTERVAL_{tf.upper()}")
             klines = self.binance_client.futures_klines(symbol=symbol, interval=interval, limit=1000)
             df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -85,12 +96,19 @@ class DataHandler:
             # Cache to Parquet
             if not os.path.exists(self.data_path):
                 os.makedirs(self.data_path)
-            df.to_parquet(os.path.join(self.data_path, f"{symbol}.parquet"))
+            df.to_parquet(cache_path)
 
             return df
         except Exception as e:
             logging.error(f"Error fetching or validating data for {symbol}: {e}")
             return None
+
+    def fetch_multi_tf(self, symbol):
+       return {
+         '15m': self.fetch_bars(symbol, '15m'),
+         '1h' : self.fetch_bars(symbol, '1h'),
+         '4h' : self.fetch_bars(symbol, '4h'),
+       }
 
     def validate_data(self, df):
         """
@@ -190,7 +208,7 @@ class SwingDetector:
         logging.info(f"Detecting pivots for {symbol}...")
         if self.pivot_model and data_15m is not None and not data_15m.empty:
             # In a real implementation, you would use more sophisticated feature engineering
-            features = self.engineer_pivot_features(data_15m, data_1h, data_4h)
+            features, _ = engineer_pivot_features(data_15m, data_1h, data_4h)
             prediction = self.pivot_model.predict(features)
             if prediction[-1] == 1:
                 pivot_price = data_15m['close'].iloc[-1]
@@ -323,9 +341,10 @@ class SignalTrader(BaseTrader):
             return
 
         # 2. Detect pivot and compute retracements
-        data_15m = self.data_handler.fetch_bars(sym, tf='15m')
-        data_1h = self.data_handler.fetch_bars(sym, tf='1h')
-        data_4h = self.data_handler.fetch_bars(sym, tf='4h')
+        multi_tf_data = self.data_handler.fetch_multi_tf(sym)
+        data_15m = multi_tf_data['15m']
+        data_1h = multi_tf_data['1h']
+        data_4h = multi_tf_data['4h']
         pivot = self.detector.detect_pivots(sym, data_15m, data_1h, data_4h)
         if not pivot:
             return
@@ -336,6 +355,9 @@ class SignalTrader(BaseTrader):
         entry_signal = self.entry_clf.predict_entry_success(sym, data_15m)
 
         # 4. Validate trend pattern
+        if not entry_signal:
+            return
+
         trend_validator = TrendPatternValidator(sym, data_1h, data_4h)
         if not trend_validator.is_valid_continuation(entry_signal['side']):
             logging.info(f"Signal for {sym} invalidated by trend pattern.")
@@ -367,8 +389,8 @@ class SignalTrader(BaseTrader):
                         logging.error(f"Failed to send Telegram message: {e}")
 
                 # Monitor for RSI confirmation (simplified)
-                sl, tp1, tp2 = self.calculate_sl_tp(entry_signal['side'], golden_zone, data)
-                self.check_rsi_confirmation(sym, entry_signal, golden_zone, sl, tp1, tp2, data)
+                sl, tp1, tp2 = self.calculate_sl_tp(entry_signal['side'], golden_zone, data_15m)
+                self.check_rsi_confirmation(sym, entry_signal, golden_zone, sl, tp1, tp2, data_15m)
 
     def calculate_sl_tp(self, side, golden_zone, data):
         """Calculates SL and TP levels."""
@@ -535,9 +557,10 @@ def train_model_for_symbol(symbol):
     settings = load_settings("configs/settings.yml")
 
     # 1. Load data for multiple timeframes
-    data_15m = DataHandler(settings).fetch_bars(symbol, tf='15m')
-    data_1h = DataHandler(settings).fetch_bars(symbol, tf='1h')
-    data_4h = DataHandler(settings).fetch_bars(symbol, tf='4h')
+    multi_tf_data = DataHandler(settings).fetch_multi_tf(symbol)
+    data_15m = multi_tf_data['15m']
+    data_1h = multi_tf_data['1h']
+    data_4h = multi_tf_data['4h']
 
     # 2. Engineer features
     X, y = engineer_pivot_features(data_15m, data_1h, data_4h)
@@ -559,8 +582,8 @@ def train_model_for_symbol(symbol):
 
     if TENSORFLOW_AVAILABLE:
         # Train LSTM model
-        X_train_lstm = X_train.reshape((X_train.shape[0], 1, X_train.shape[1]))
-        X_test_lstm = X_test.reshape((X_test.shape[0], 1, X_test.shape[1]))
+        X_train_lstm = X_train.values.reshape((X_train.shape[0], 1, X_train.shape[1]))
+        X_test_lstm = X_test.values.reshape((X_test.shape[0], 1, X_test.shape[1]))
         lstm_model = Sequential([
             Input(shape=(X_train_lstm.shape[1], X_train_lstm.shape[2])),
             LSTM(50, activation='relu'),

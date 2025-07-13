@@ -26,3 +26,4 @@ lightgbm
 tensorflow
 shap
 pywavelets
+python-telegram-bot
