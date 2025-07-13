@@ -1,29 +1,12 @@
-# Add your project's dependencies here.
-# For example:
-# pandas
-# numpy
-# scikit-learn
-# lightgbm
-# tensorflow
-# python-binance
-# python-telegram-bot
-# pyarrow
-# mlflow
-# great-expectations
-# feast
-# redis
-# prometheus-client
-# grafana-client
-# shap
-pyyaml
-python-binance
-pyarrow
-great-expectations
-redis
-feast
-mlflow
+pandas>=2.0
+numpy
+scikit-learn
 lightgbm
-tensorflow
-shap
-pywavelets
+joblib
+pyyaml
 python-telegram-bot
+shap
+PyWavelets
+pandas-ta
+python-binance
+tensorflow

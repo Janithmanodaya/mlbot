@@ -6,3 +6,14 @@ reports_path: ./reports
 symbols_file: ./symbols.csv
 cycle_break_s: 10
 optuna_trials: 100 # Number of trials for hyperparameter optimization
+
+# Window parameters
+pivot_lookback:      50
+feature_lookback:    100
+rsi_period:          14
+sltp_lookback:       15
+
+# Virtual‑order parameters
+max_virtual_orders_per_symbol: 1
+order_expiry_cycles:           10   # remove stale virtual orders after N loops
+pivot_confidence_thresh: 0.6   # only accept pivots with ≥60% confidence

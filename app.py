@@ -15,6 +15,7 @@ import asyncio
 import lightgbm as lgb
 import shap
 import pywt
+import pandas_ta as ta
 try:
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dense, Input
@@ -33,6 +34,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 # --- 1. Project Layout & Configuration ---
+CONFIG_PATH = "configs/settings.yml"
+HYPER_PATH = "configs/hyperparams.json"
+SYMBOLS_PATH = "configs/symbols.csv"
 
 def load_settings(config_path):
     """Loads settings from a YAML file."""
@@ -191,6 +195,7 @@ class SwingDetector:
         self.reporter = reporter
         self.model_path = os.path.join(settings['models_path'], 'pivot_model.pkl')
         self.pivot_model = self.load_model()
+        self.pivot_confidence_thresh = settings.get('pivot_confidence_thresh', 0.6)
 
     def load_model(self):
         """Loads the pivot detection model."""
@@ -203,28 +208,31 @@ class SwingDetector:
                 return None
         return None
 
-    def detect_pivots(self, symbol, data_15m, data_1h, data_4h):
+    def detect_pivots(self, symbol, data_15m, data_1h, data_4h, pivot_lb):
         """Detects swing pivots in the data."""
         logging.info(f"Detecting pivots for {symbol}...")
         if self.pivot_model and data_15m is not None and not data_15m.empty:
             # In a real implementation, you would use more sophisticated feature engineering
-            features, _ = engineer_pivot_features(data_15m, data_1h, data_4h)
-            prediction = self.pivot_model.predict(features)
-            if prediction[-1] == 1:
+            X, _ = engineer_pivot_features(data_15m, data_1h, data_4h, pivot_lb)
+            probs = self.pivot_model.predict_proba(X)
+            last_conf = float(probs[-1, 1])
+            if last_conf >= self.pivot_confidence_thresh:
                 pivot_price = data_15m['close'].iloc[-1]
-                self.reporter.log_identification(symbol, "pivot", {"price": pivot_price})
-                return {"price": pivot_price, "type": "high"}
+                logging.info(f"{symbol} pivot @ {pivot_price:.4f} with confidence {last_conf:.2%}")
+                self.reporter.log_identification(symbol, "pivot", {"price": pivot_price}, confidence=last_conf)
+                return {"price": pivot_price, "type": "high", "confidence": last_conf}
         return None
 
-    def calculate_golden_zone(self, pivot, data):
+    def calculate_golden_zone(self, pivot, data, sltp_lb):
         """
         Calculates the Fibonacci golden zone for a pivot.
         This is a placeholder for a real implementation with an "optimal zone"
         per coin, updated monthly.
         """
         if data is not None and not data.empty:
-            high = data['high'].iloc[-15:].max()
-            low = data['low'].iloc[-15:].min()
+            data = data.tail(sltp_lb)
+            high = data['high'].max()
+            low = data['low'].min()
 
             if pivot['type'] == 'high':
                 retracement_50 = high - (high - low) * 0.5
@@ -241,7 +249,7 @@ class EntryClassifier:
         self.settings = settings
         self.reporter = reporter
         try:
-            self.entry_confidence_thresh = load_hyperparams('configs/hyperparams.json').get('entry_confidence_thresh', 0.5)
+            self.entry_confidence_thresh = load_hyperparams(HYPER_PATH).get('entry_confidence_thresh', 0.5)
         except FileNotFoundError:
             self.entry_confidence_thresh = 0.5
         self.model_path = os.path.join(settings['models_path'], 'entry_model.pkl')
@@ -289,20 +297,27 @@ class Reporter:
         if not os.path.exists(self.reports_path):
             os.makedirs(self.reports_path)
 
-    def __init__(self, settings):
-        self.telegram_bot = None
-
     def start_run_report(self):
         pass
 
-    def log_identification(self, symbol, id_type, details):
-        pass
+    def log_identification(self, symbol, id_type, details, confidence=None):
+        details['confidence'] = confidence
+        report_file = os.path.join(self.reports_path, f"{symbol}_report.json")
+        with open(report_file, 'a') as f:
+            json.dump({"timestamp": datetime.now().isoformat(), "type": "identification", "id_type": id_type, "details": details}, f)
+            f.write('\n')
 
     def log_rejection(self, symbol, reason, details):
-        pass
+        report_file = os.path.join(self.reports_path, f"{symbol}_report.json")
+        with open(report_file, 'a') as f:
+            json.dump({"timestamp": datetime.now().isoformat(), "type": "rejection", "reason": reason, "details": details}, f)
+            f.write('\n')
 
     def log_virtual_order(self, symbol, order_details):
-        pass
+        report_file = os.path.join(self.reports_path, f"{symbol}_report.json")
+        with open(report_file, 'a') as f:
+            json.dump({"timestamp": datetime.now().isoformat(), "type": "virtual_order", "details": order_details}, f)
+            f.write('\n')
 
     def log_real_order(self, symbol, order_details):
         pass
@@ -322,7 +337,7 @@ class Reporter:
 class BaseTrader:
     def __init__(self, settings, detector, entry_clf, reporter, telegram_bot):
         self.settings = settings
-        self.hyperparams = load_hyperparams('configs/hyperparams.json')
+        self.hyperparams = load_hyperparams(HYPER_PATH)
         self.detector = detector
         self.entry_clf = entry_clf
         self.reporter = reporter
@@ -333,11 +348,12 @@ class BaseTrader:
         raise NotImplementedError
 
 class SignalTrader(BaseTrader):
-    def process_symbol(self, sym, seen_orders):
+    def process_symbol(self, sym, seen_orders, pivot_lb, feat_lb, sltp_lb, rsi_period, max_virt, pending_msgs, pivot_events):
         logging.info(f"[Signal] Processing {sym}...")
         # 1. Check for outstanding virtual orders
-        if self.has_outstanding_virtual_order(sym):
-            logging.info(f"Skipping {sym} due to outstanding virtual order.")
+        symbol_orders = [k for k in seen_orders.keys() if k[0] == sym]
+        if len(symbol_orders) >= max_virt:
+            logging.info(f"Skipping {sym} due to max virtual orders.")
             return
 
         # 2. Detect pivot and compute retracements
@@ -345,14 +361,22 @@ class SignalTrader(BaseTrader):
         data_15m = multi_tf_data['15m']
         data_1h = multi_tf_data['1h']
         data_4h = multi_tf_data['4h']
-        pivot = self.detector.detect_pivots(sym, data_15m, data_1h, data_4h)
+        pivot = self.detector.detect_pivots(sym, data_15m, data_1h, data_4h, pivot_lb)
+        if pivot:
+            pivot_events.append({
+                "symbol": sym,
+                "pivot_type": pivot['type'],
+                "pivot_price": pivot['price'],
+                "confidence": pivot['confidence'],
+                "cycle": 0 # cycle will be updated in main
+            })
         if not pivot:
             return
 
-        golden_zone = self.detector.calculate_golden_zone(pivot, data_15m)
+        golden_zone = self.detector.calculate_golden_zone(pivot, data_15m.tail(feat_lb), sltp_lb)
 
         # 3. Predict entry and check confidence
-        entry_signal = self.entry_clf.predict_entry_success(sym, data_15m)
+        entry_signal = self.entry_clf.predict_entry_success(sym, data_15m.tail(feat_lb))
 
         # 4. Validate trend pattern
         if not entry_signal:
@@ -370,7 +394,7 @@ class SignalTrader(BaseTrader):
                 # Active signal monitoring
                 if not trend_validator.is_valid_continuation(entry_signal['side']):
                     logging.info(f"Canceling signal for {sym} due to trend invalidation.")
-                    seen_orders.remove(order_key)
+                    del seen_orders[order_key]
                     self.reporter.log_rejection(sym, "signal_canceled_trend_invalidation", {})
                     return
 
@@ -378,24 +402,22 @@ class SignalTrader(BaseTrader):
             order_key = (sym, entry_signal['side'], round(golden_zone['entry_min'], 4))
             if order_key not in seen_orders:
                 # 4. Place virtual order and notify
-                seen_orders.add(order_key)
+                seen_orders[order_key] = 0 # Using 0 as cycle number, will be updated in main loop
                 self.reporter.log_virtual_order(sym, {"side": entry_signal['side'], "price": golden_zone['entry_min']})
                 log_msg = f"Signal placed for {sym}: {entry_signal['side']} @ {golden_zone['entry_min']:.4f}"
                 logging.info(log_msg)
                 if self.telegram_bot:
-                    try:
-                        asyncio.run(self.telegram_bot.send_message(chat_id=keys.telegram_chat_id, text=log_msg))
-                    except Exception as e:
-                        logging.error(f"Failed to send Telegram message: {e}")
+                    pending_msgs.append(log_msg)
 
                 # Monitor for RSI confirmation (simplified)
-                sl, tp1, tp2 = self.calculate_sl_tp(entry_signal['side'], golden_zone, data_15m)
-                self.check_rsi_confirmation(sym, entry_signal, golden_zone, sl, tp1, tp2, data_15m)
+                sl, tp1, tp2 = self.calculate_sl_tp(entry_signal['side'], golden_zone, data_15m, sltp_lb)
+                self.check_rsi_confirmation(sym, entry_signal, golden_zone, sl, tp1, tp2, data_15m, rsi_period, pending_msgs)
 
-    def calculate_sl_tp(self, side, golden_zone, data):
+    def calculate_sl_tp(self, side, golden_zone, data, sltp_lb):
         """Calculates SL and TP levels."""
-        high = data['high'].iloc[-15:].max()
-        low = data['low'].iloc[-15:].min()
+        data = data.tail(sltp_lb)
+        high = data['high'].max()
+        low = data['low'].min()
 
         if side == 'long':
             sl = low
@@ -407,18 +429,15 @@ class SignalTrader(BaseTrader):
             tp2 = golden_zone['entry_min'] - (high - low)
         return sl, tp1, tp2
 
-    def has_outstanding_virtual_order(self, symbol):
-        """Checks if there is an outstanding virtual order for the symbol."""
-        # This is a placeholder. In a real implementation, you would check a
-        # database or an in-memory store for outstanding virtual orders.
-        return False
+    def rsi_ok(self, side, data, rsi_period):
+        rsi = ta.rsi(data['close'], length=rsi_period)
+        val = rsi.iloc[-1]
+        return (val < 30 and side=='long') or (val > 70 and side=='short')
 
-    def check_rsi_confirmation(self, sym, entry_signal, golden_zone, sl, tp1, tp2, data):
+    def check_rsi_confirmation(self, sym, entry_signal, golden_zone, sl, tp1, tp2, data, rsi_period, pending_msgs):
         # Placeholder for RSI check
         logging.info(f"Waiting for RSI confirmation on {sym}...")
-        time.sleep(1)
-        rsi_ok = True # Simulate successful RSI check
-        if rsi_ok:
+        if self.rsi_ok(entry_signal['side'], data, rsi_period):
             logging.info(f"RSI confirmed for {sym}!")
             if self.telegram_bot:
                 side_emoji = "📈" if entry_signal['side'] == 'long' else "📉"
@@ -433,10 +452,7 @@ class SignalTrader(BaseTrader):
                     f"**TP1:** {tp1:.4f}\n"
                     f"**TP2:** {tp2:.4f}"
                 )
-                try:
-                    asyncio.run(self.telegram_bot.send_message(chat_id=keys.telegram_chat_id, text=log_msg, parse_mode='Markdown'))
-                except Exception as e:
-                    logging.error(f"Failed to send Telegram message: {e}")
+                pending_msgs.append(log_msg)
 
 
 class LiveTrader(SignalTrader):
@@ -544,8 +560,11 @@ class LiveTrader(SignalTrader):
 
 # --- Training and Backtesting Functions ---
 
-def engineer_pivot_features(data_15m, data_1h, data_4h):
+def engineer_pivot_features(d15, d1h, d4h, pivot_lb):
     """Engineers features for the pivot model."""
+    if d15 is None or d1h is None or d4h is None:
+        return None, None
+    d15, d1h, d4h = d15.tail(pivot_lb), d1h.tail(pivot_lb), d4h.tail(pivot_lb)
     # This is a placeholder for a real implementation.
     # You would combine the data from the different timeframes
     # to create features for the model.
@@ -554,7 +573,7 @@ def engineer_pivot_features(data_15m, data_1h, data_4h):
 def train_model_for_symbol(symbol):
     """Trains and saves a simple model for a symbol."""
     logging.info(f"Training models for {symbol}...")
-    settings = load_settings("configs/settings.yml")
+    settings = load_settings(CONFIG_PATH)
 
     # 1. Load data for multiple timeframes
     multi_tf_data = DataHandler(settings).fetch_multi_tf(symbol)
@@ -563,7 +582,7 @@ def train_model_for_symbol(symbol):
     data_4h = multi_tf_data['4h']
 
     # 2. Engineer features
-    X, y = engineer_pivot_features(data_15m, data_1h, data_4h)
+    X, y = engineer_pivot_features(data_15m, data_1h, data_4h, settings['pivot_lookback'])
     X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
 
@@ -648,12 +667,13 @@ def run_multithreaded_training(symbols, max_workers):
     logging.info("Multithreaded training complete.")
     print(results)
 
-def run_backtest(symbols, trader, reporter):
+def run_backtest(symbols, trader, reporter, pivot_lb, feat_lb, sltp_lb, rsi_period):
     """Runs a backtest across all symbols."""
     logging.info("Starting backtest...")
     reporter.start_run_report()
+    pending_msgs = []
     for sym in symbols:
-        trader.process_symbol(sym, set()) # Use a dummy set for seen_orders in backtest
+        trader.process_symbol(sym, {}, pivot_lb, feat_lb, sltp_lb, rsi_period, 1, pending_msgs) # Use a dummy dict for seen_orders in backtest
     reporter.finalize_report()
     logging.info("Backtest complete.")
 
@@ -661,8 +681,14 @@ def run_backtest(symbols, trader, reporter):
 
 def main():
     """Main entry point for the application."""
-    settings = load_settings("configs/settings.yml")
-    hyperparams = load_hyperparams("configs/hyperparams.json")
+    settings = load_settings(CONFIG_PATH)
+    hyperparams = load_hyperparams(HYPER_PATH)
+    PIVOT_LB = settings['pivot_lookback']
+    FEAT_LB = settings['feature_lookback']
+    RSI_PERIOD = settings['rsi_period']
+    SLTP_LB = settings['sltp_lookback']
+    MAX_VIRT = settings['max_virtual_orders_per_symbol']
+    EXPIRY = settings['order_expiry_cycles']
 
     try:
         telegram_bot = telegram.Bot(token=keys.telegram_bot_token)
@@ -692,14 +718,14 @@ def main():
             reporter.start_run_report()
             reporter.finalize_report()
             settings['mode'] = 'signal' # Switch to signal mode after training
-            save_settings(settings, "configs/settings.yml")
+            save_settings(settings, CONFIG_PATH)
             logging.info("Training complete. Switching to signal mode.")
             # The loop will continue, and in the next iteration, it will be in signal mode.
 
         elif mode == "backtest":
             trader = SignalTrader(settings, detector, entry_clf, reporter, telegram_bot)
             symbols = load_symbols(settings['symbols_file'])
-            run_backtest(symbols, trader, reporter)
+            run_backtest(symbols, trader, reporter, PIVOT_LB, FEAT_LB, SLTP_LB, RSI_PERIOD)
             running = False # Exit after backtest
 
         else: # signal or live mode
@@ -717,18 +743,43 @@ def main():
                     if mode == "live" \
                     else SignalTrader(settings, detector, entry_clf, reporter, telegram_bot)
 
-                symbols = load_symbols(settings['symbols_file'])
-                seen_orders = set()
+                symbols = load_symbols(SYMBOLS_PATH)
+                seen_orders = {}
+                cycle_n = 0
 
                 reporter.start_run_report()
                 try:
                     while True:
                         logging.info("--- Starting new trading cycle ---")
+                        cycle_n += 1
+                        pending_msgs = []
+                        pivot_events = []
+                        for key, placed_cycle in list(seen_orders.items()):
+                            if cycle_n - placed_cycle > EXPIRY:
+                                del seen_orders[key]
+                                reporter.log_rejection(key[0], "order_expired", {})
                         for sym in symbols:
                             if isinstance(trader, LiveTrader):
                                 asyncio.run(trader.process_symbol_async(sym, seen_orders))
                             else:
-                                trader.process_symbol(sym, seen_orders)
+                                trader.process_symbol(sym, seen_orders, PIVOT_LB, FEAT_LB, SLTP_LB, RSI_PERIOD, MAX_VIRT, pending_msgs, pivot_events)
+                        if telegram_bot and pending_msgs:
+                            asyncio.run(asyncio.gather(*[
+                                telegram_bot.send_message(chat_id=keys.telegram_chat_id, text=msg)
+                                for msg in pending_msgs
+                            ]))
+
+                        if pivot_events:
+                            for event in pivot_events:
+                                event['cycle'] = cycle_n
+                            report_path = os.path.join(settings['reports_path'], f"pivots_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+                            pd.DataFrame(pivot_events).to_csv(report_path, index=False)
+
+                            # Leaderboard
+                            top = sorted(pivot_events, key=lambda x: x['confidence'], reverse=True)[:10]
+                            logging.info("Top pivot confidences: " + ", ".join(f"{s['symbol']}:{s['confidence']:.1%}" for s in top))
+
+
                         logging.info(f"--- Cycle complete, sleeping for {settings.get('cycle_break_s', 10)}s ---")
                         time.sleep(settings.get('cycle_break_s', 10))
                 except KeyboardInterrupt:
