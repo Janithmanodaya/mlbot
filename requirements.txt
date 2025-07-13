@@ -16,3 +16,13 @@
 # grafana-client
 # shap
 pyyaml
+python-binance
+pyarrow
+great-expectations
+redis
+feast
+mlflow
+lightgbm
+tensorflow
+shap
+pywavelets

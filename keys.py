@@ -1,18 +1,14 @@
-# This file will contain the functions to get the Binance and Telegram clients.
-import os
+# keys.py
 
-def get_binance_client():
-    # In a real application, use a secure way to store and retrieve API keys,
-    # such as environment variables, a secrets management tool, or a
-    # configuration file that is not checked into version control.
-    api_key = os.environ.get("BINANCE_API_KEY", "YOUR_API_KEY")
-    api_secret = os.environ.get("BINANCE_API_SECRET", "YOUR_API_SECRET")
-    # return BinanceClient(api_key, api_secret)
-    return None # Placeholder
+# Testnet Futures API credentials
+api_testnet   = "7fabcde36d70d00d01f9a3d21b38855450aec5c4348d2361fac5c6bd44afd872"
+secret_testnet = "4c22d3644841e6912dd957a0dfbfd4a6475b7bb6bc3022261173de41f165949c"
 
-def get_telegram_bot():
-    # In a real application, use a secure way to store and retrieve the
-    # Telegram bot token.
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-    # return TelegramBot(token)
-    return None # Placeholder
+# (Optional) Mainnet credentials if you later want to switch environments
+api_mainnet   = "vxFwGRQPnABh0YDtPTHrTpW1hsgKRPVutr94XlbkGeR1P0QzdZNYZXU1Dz1Uud5p"
+secret_mainnet = "E2qnexdIucEmJ7ZDwbJps4jPTt9V2evuVjJYGNOvrzLKI6ZMgwjsSHppkhjIz4cD"
+
+
+# Telegram Bot Configuration
+telegram_bot_token = "8184556638:AAE4cJMUf0z7yPoXd5si12SrqV_n_2k4eeQ" # Replace with your actual bot token
+telegram_chat_id = "7144191785" # Replace with your actual chat ID

@@ -5,3 +5,4 @@ models_path: ./models
 reports_path: ./reports
 symbols_file: ./symbols.csv
 cycle_break_s: 10
+optuna_trials: 100 # Number of trials for hyperparameter optimization
